@@ -1,0 +1,1756 @@
+import tkinter as tk
+from PIL import Image, ImageTk, ImageFile
+from evdev import InputDevice, categorize, ecodes
+import tkinter.messagebox as msgbox
+import os
+import qrcode
+import requests
+import threading
+import serial
+import time
+import nfc
+import serial.tools.list_ports
+import pynmea2   
+
+FIREBASE_BASE = "https://expo-project-c59bb-default-rtdb.asia-southeast1.firebasedatabase.app"
+ORDERS_URL    = f"{FIREBASE_BASE}/orders"
+LOCATION_URL  = f"{FIREBASE_BASE}/device/location.json"
+
+SESSION = requests.Session()  
+
+# [CH00] GPS
+
+def connect_gps():
+    while True:
+        try:
+            gps_port = serial.Serial("/dev/serial0", baudrate=9600, timeout=1)
+            print("GPS 모듈연결")
+            return gps_port
+        except Exception as e:
+            print(f" GPS 연결실패: {e},재시도")
+            time.sleep(5)
+
+def gps_listener():
+    gps_port = connect_gps()
+    last_sent = 0   
+    last_log = 0     
+    log_interval = 5
+    upload_interval = 1
+
+    while True:
+        try:
+            line = gps_port.readline().decode("utf-8", errors="ignore")
+            if line.startswith(("$GNGGA", "$GPGGA")):
+                msg = pynmea2.parse(line)
+
+                
+                if getattr(msg, "gps_qual", 0) and msg.gps_qual > 0 and msg.latitude and msg.longitude:
+                    lat = float(msg.latitude)
+                    lon = float(msg.longitude)
+                    now = time.time()
+
+                    if now - last_sent >= upload_interval:
+                        try:
+                            SESSION.patch(
+                                LOCATION_URL,
+                                json={"lat": lat, "lon": lon, "timestamp": int(now)},
+                                timeout=5
+                            )
+                        except Exception as re:
+                            print(f"Firebase 위치 업로드 에러: {re}")
+                        last_sent = now
+
+                    if now - last_log >= log_interval:
+                        print(f"[GPS] 현재 좌표 lat={lat}, lon={lon}")
+                        last_log = now
+
+        except Exception as e:
+            print(f" GPS 에러:{e}")
+            try:
+                gps_port.close()
+            except:
+                pass
+            gps_port = connect_gps()
+threading.Thread(target=gps_listener, daemon=True).start()
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+
+
+def find_arduino_port():
+    ports = serial.tools.list_ports.comports()
+    for p in ports:
+        if ("Arduino" in str(p.manufacturer)) or ("2560" in str(p.description)):
+            return p.device
+    for p in ports:
+        if "ttyACM" in p.device:
+            return p.device
+    return None
+port_name = find_arduino_port()
+
+if port_name:
+    serial_port = serial.Serial(port_name, 9600, timeout=1)
+else:
+    serial_port = None
+
+
+def find_arduino_port():
+    ports = serial.tools.list_ports.comports()
+    for p in ports:
+        if "ttyACM" in p.device or "Arduino" in p.description:
+            return p.device
+    return None
+
+try:
+    port_name = find_arduino_port()
+    if port_name:
+        serial_port = serial.Serial(port_name, 9600, timeout=1)
+        print(f"Serial port opened: {port_name}")
+    else:
+        print("DONFIND ARDUINO")
+        serial_port = None
+except Exception as e:
+    print(f"Failed to open serial port: {e}")
+    serial_port = None
+
+root = tk.Tk()
+root.title("MoAS Vending UI")
+root.geometry("1680x1050")
+root.configure(bg="#282828")
+root.attributes("-fullscreen", True)
+
+def load_image(path):
+    img = Image.open(path)
+    return ImageTk.PhotoImage(img)
+
+frames = {}
+
+def show_page(name):
+    for frame in frames.values():
+        frame.pack_forget()
+    frames[name].pack()
+
+    if name == "product":
+        reset_button_states()
+        start_product_timeout()
+    else:
+        cancel_product_timeout()
+
+
+def reset_button_states():
+    for name in P_labels:
+        pid_map = {
+            "P1": "A001",
+            "P2": "A002",
+            "P3": "A003",
+            "P4": "A004",
+            "P5": "A005",
+            "P6": "A006",
+        }
+
+        try:
+            stock = SESSION.get(f"{FIREBASE_BASE}/stock.json", timeout=5).json()
+        except:
+            stock = {}
+
+        pid = pid_map[name]
+
+        if stock.get(pid, 0) == 0:
+            P_labels[name].config(image=P_imgs[name][2])  
+            P_labels[name].unbind("<Button-1>")          
+        else:
+            P_labels[name].config(image=P_imgs[name][0]) 
+            P_labels[name].bind("<Button-1>", lambda e, n=name: select_product(n))
+            stock_canvas_ch04[name].config(bg="#FFFFFF")
+
+    selected_product[0] = None
+
+# ------------메인화면 --------------------
+
+main_frame = tk.Frame(root, width=1680, height=1050)
+main_bg = load_image("img/START_BG.png")
+main_label = tk.Label(main_frame, image=main_bg)
+main_label.pack()
+
+stock_btn_img = ImageTk.PhotoImage(Image.open("img/stock_btn.png"))
+
+stock_btn = tk.Button(
+    main_frame,
+    image=stock_btn_img,
+    bd=0,
+    bg="#282828",
+    activebackground="#282828",
+    highlightthickness=0,
+    relief="flat",
+    command=lambda: show_page("stock")
+)
+
+
+stock_btn.place(x=20, y=20, width=200, height=100)
+
+
+main_frame.stock_btn_img = stock_btn_img
+
+main_label.bind("<Button-1>", lambda e: show_page("product"))
+frames["main"] = main_frame
+DRIVING_URL = f"{FIREBASE_BASE}/move/move.json"
+CALL_URL    = f"{FIREBASE_BASE}/move/call.json"
+
+driving_popup = None
+call_popup = None
+last_driving_state = None
+last_call_state = None
+
+
+def show_driving_overlay():
+    global driving_popup, driving_img_tk
+    try:
+        if driving_popup and driving_popup.winfo_exists():
+            return
+        driving_popup = tk.Toplevel(root)
+        driving_popup.overrideredirect(True)
+        driving_popup.geometry("1680x1050+0+0")
+        driving_popup.configure(bg="#000000")
+
+        driving_img = Image.open("img/DRIVING_BG.png") 
+        driving_img_tk = ImageTk.PhotoImage(driving_img)
+        lbl = tk.Label(driving_popup, image=driving_img_tk, bd=0)
+        lbl.place(x=0, y=0, width=1680, height=1050)
+
+        driving_popup.lbl = lbl
+        driving_popup.img_ref = driving_img_tk
+    except Exception as e:
+        print(f"[show_driving_overlay Error] {e}")
+
+def close_driving_overlay():
+
+    global driving_popup
+    try:
+        if driving_popup and driving_popup.winfo_exists():
+            driving_popup.destroy()
+            
+    except Exception as e:
+        print(f"[close_driving_overlay Error] {e}")
+    driving_popup = None
+
+def show_call_overlay():
+
+    global call_popup, call_img_tk
+    try:
+        if call_popup and call_popup.winfo_exists():
+            return
+        call_popup = tk.Toplevel(root)
+        call_popup.overrideredirect(True)
+        call_popup.geometry("1680x1050+0+0")
+        call_popup.configure(bg="#000000")
+
+        call_img = Image.open("img/CALL_BG.png") 
+        call_img_tk = ImageTk.PhotoImage(call_img)
+        lbl = tk.Label(call_popup, image=call_img_tk, bd=0)
+        lbl.place(x=0, y=0, width=1680, height=1050)
+
+        call_popup.lbl = lbl
+        call_popup.img_ref = call_img_tk
+    except Exception as e:
+        print(f"[show_call_overlay Error] {e}")
+
+
+def close_call_overlay():
+    """호출 종료 시 오버레이 닫기"""
+    global call_popup
+    try:
+        if call_popup and call_popup.winfo_exists():
+            call_popup.destroy()
+            print("💨 Call overlay 닫힘")
+    except Exception as e:
+        print(f"[close_call_overlay Error] {e}")
+    call_popup = None
+
+
+def driving_state_listener():
+    global last_driving_state, last_call_state
+
+    while True:
+        try:
+            res_move = SESSION.get(DRIVING_URL, timeout=5)
+            res_call = SESSION.get(CALL_URL, timeout=5)
+
+       
+            if res_move.status_code == 200:
+                driving_state = res_move.json()
+                if driving_state != last_driving_state:
+                    print(f"[Driving State] 변경 감지: {driving_state}")
+                    last_driving_state = driving_state
+
+                    if frames.get("main") and frames["main"].winfo_ismapped():
+                        if driving_state == "driving_start":
+                            root.after(0, show_driving_overlay)
+                        elif driving_state == "driving_stop":
+                            root.after(0, close_driving_overlay)
+                    else:
+                        if driving_popup and driving_popup.winfo_exists():
+                            root.after(0, close_driving_overlay)
+
+      
+            if res_call.status_code == 200:
+                call_state = res_call.json()
+                if call_state != last_call_state:
+                    print(f"[Call State] 변경 감지: {call_state}")
+                    last_call_state = call_state
+
+                    if frames.get("main") and frames["main"].winfo_ismapped():
+                        if call_state == "call_start":
+                            root.after(0, show_call_overlay)
+                        elif call_state == "call_stop":
+                            root.after(0, close_call_overlay)
+                    else:
+                        if call_popup and call_popup.winfo_exists():
+                            root.after(0, close_call_overlay)
+
+            time.sleep(1.5)
+
+        except Exception as e:
+            print(f"[Driving Listener Error] {e}")
+            time.sleep(3)
+
+#--------------------재고 관리 화면 -----------------------
+
+stock_frame = tk.Frame(root, width=1680, height=1050, bg="#000000")
+stock_bg_img = ImageTk.PhotoImage(Image.open("img/stock_bg.png"))
+tk.Label(stock_frame, image=stock_bg_img, bd=0).place(
+    x=0, y=0, width=1680, height=1050
+)
+HB_img_stock = ImageTk.PhotoImage(Image.open("img/ICON_H.png"))
+HB_stock = tk.Button(
+    stock_frame,
+    image=HB_img_stock,
+    bd=0,
+    bg="#91BDFF",
+    activebackground="#91BDFF",
+    highlightthickness=0,
+    relief="flat",
+    command=lambda: show_page("main")
+)
+HB_stock.place(x=1405, y=20, width=250, height=80)
+
+pid_list = ["A001", "A002", "A003", "A004", "A005", "A006"]
+max_stock = {"A001": 3,"A002": 4,"A003": 3,"A004": 4,"A005": 4,"A006": 4,}
+stock_boxes = [(30, 594),(310, 594),(590, 594),(870, 594),(1150, 594),(1430, 594),]
+
+stock_labels = []  
+stock_label_ch03 = {}  
+
+pname_list = ["P1", "P2", "P3", "P4", "P5", "P6"]
+
+for (x, y), pname in zip(stock_boxes, pname_list):
+    lbl = tk.Label(
+        stock_frame,
+        text="0",
+        font=("Pretendard", 70, "bold"),
+        fg="white",
+        bg="#000000"
+    )
+    lbl.place(x=x, y=y, width=220, height=140)
+
+    stock_labels.append(lbl)
+    stock_label_ch03[pname] = lbl  
+
+pid_map = {"P1": "A001","P2": "A002","P3": "A003","P4": "A004","P5": "A005","P6": "A006",}
+
+def load_stock():
+    try:
+        res = SESSION.get(f"{FIREBASE_BASE}/stock.json", timeout=5)
+        if res.status_code == 200:
+            return res.json()
+    except:
+        pass
+    return {}
+
+def update_ch03_stock_labels(stock):
+    for pname, pid in pid_map.items():
+        qty = stock.get(pid, 0)
+        stock_label_ch03[pname].config(text=str(qty))
+
+def set_stock(pid, value):
+    """Firebase 스톡 저장"""
+    try:
+        SESSION.patch(
+            f"{FIREBASE_BASE}/stock.json",
+            json={pid: value},
+            timeout=5
+        )
+    except Exception as e:
+        print("Stock update failed:", e)
+
+
+def increase_stock(pid, index):
+    current = int(stock_labels[index].cget("text"))
+    if current < max_stock[pid]:
+        new_value = current + 1
+        stock_labels[index].config(text=str(new_value))
+        set_stock(pid, new_value)
+        stock = load_stock()
+        update_ch03_stock_labels(stock)
+
+
+def decrease_stock(pid, index):
+    current = int(stock_labels[index].cget("text"))
+    if current > 0:
+        new_value = current - 1
+        stock_labels[index].config(text=str(new_value))
+        set_stock(pid, new_value)
+        stock = load_stock()
+        update_ch03_stock_labels(stock)
+
+btn_up_img   = ImageTk.PhotoImage(Image.open("img/btn_up.png"))
+btn_down_img = ImageTk.PhotoImage(Image.open("img/btn_down.png"))
+
+up_coords = [(50, 455),(330, 455),(610, 455),(890, 455),(1170, 455),(1450, 455),]
+down_coords = [(50, 765),(330, 765),(610, 765),(890, 765),(1170, 765),(1450, 765),]
+
+for i in range(6):
+    pid = pid_list[i]
+
+    tk.Button(
+        stock_frame,
+        image=btn_up_img,
+        bd=0,
+        bg="#FFFFFF",
+        activebackground="#FFFFFF",
+        relief="flat",
+        command=lambda idx=i, p=pid: increase_stock(p, idx)
+    ).place(x=up_coords[i][0], y=up_coords[i][1], width=180, height=100)
+
+    tk.Button(
+        stock_frame,
+        image=btn_down_img,
+        bd=0,
+        bg="#FFFFFF",
+        activebackground="#FFFFFF",
+        relief="flat",
+        command=lambda idx=i, p=pid: decrease_stock(p, idx)
+    ).place(x=down_coords[i][0], y=down_coords[i][1], width=180, height=100)
+
+stock_0_img = ImageTk.PhotoImage(Image.open("img/stock_0.png"))
+stock_full_img = ImageTk.PhotoImage(Image.open("img/stock_full.png"))
+
+def set_all_stock_zero():
+    for pid in pid_list:
+        set_stock(pid, 0)
+    stock = load_stock()
+    update_ch03_stock_labels(stock)
+    print("모든 스톡을 0 설정.")
+
+def set_all_stock_full():
+    for pid in pid_list:
+        set_stock(pid, max_stock[pid])
+    stock = load_stock()
+    update_ch03_stock_labels(stock)
+    print("모든 스톡을 max로 설정")
+
+tk.Button(
+    stock_frame,
+    image=stock_0_img,
+    bd=0,
+    bg="#282828",
+    activebackground="#282828",
+    command=set_all_stock_zero
+).place(x=20, y=915, width=480, height=120)
+
+tk.Button(
+    stock_frame,
+    image=stock_full_img,
+    bd=0,
+    bg="#282828",
+    activebackground="#282828",
+    command=set_all_stock_full
+).place(x=1180, y=915, width=480, height=120)
+
+frames["stock"] = stock_frame
+root.after(200, lambda: update_ch03_stock_labels(load_stock()))
+
+def open_stock_page():
+    stock = load_stock()
+    update_ch03_stock_labels(stock)
+    show_page("stock")
+
+# ------------------- 상품선택 화면-------------------------------------------
+product_frame = tk.Frame(root, width=1680, height=1050, bg="#282828")
+product_bg = load_image("img/BG.png")
+tk.Label(product_frame, image=product_bg, bg="#282828").place(x=0, y=0, width=1680, height=1050)
+
+P_imgs = {
+    "P1": [
+        ImageTk.PhotoImage(Image.open("img/OBJ_1_N.png")), 
+        ImageTk.PhotoImage(Image.open("img/OBJ_1_P.png")),
+        ImageTk.PhotoImage(Image.open("img/OBJ_1_Sold.png"))],
+    "P2": [
+        ImageTk.PhotoImage(Image.open("img/OBJ_2_N.png")),
+        ImageTk.PhotoImage(Image.open("img/OBJ_2_P.png")),
+        ImageTk.PhotoImage(Image.open("img/OBJ_2_Sold.png"))],
+    "P3": [
+        ImageTk.PhotoImage(Image.open("img/OBJ_3_N.png")),
+        ImageTk.PhotoImage(Image.open("img/OBJ_3_P.png")),
+        ImageTk.PhotoImage(Image.open("img/OBJ_3_Sold.png"))],
+    "P4": [
+        ImageTk.PhotoImage(Image.open("img/OBJ_4_N.png")),
+        ImageTk.PhotoImage(Image.open("img/OBJ_4_P.png")),
+        ImageTk.PhotoImage(Image.open("img/OBJ_4_Sold.png"))],
+    "P5": [
+        ImageTk.PhotoImage(Image.open("img/OBJ_5_N.png")),
+        ImageTk.PhotoImage(Image.open("img/OBJ_5_P.png")),
+        ImageTk.PhotoImage(Image.open("img/OBJ_5_Sold.png"))],
+    "P6": [
+        ImageTk.PhotoImage(Image.open("img/OBJ_6_N.png")),
+        ImageTk.PhotoImage(Image.open("img/OBJ_6_P.png")),
+        ImageTk.PhotoImage(Image.open("img/OBJ_6_Sold.png"))],
+}
+
+char_img = ImageTk.PhotoImage(Image.open("img/mire.png"))
+CB_img = ImageTk.PhotoImage(Image.open("img/PAYB_N.png"))
+CB_on  = ImageTk.PhotoImage(Image.open("img/PAYB_P.png"))
+HB_img_product = ImageTk.PhotoImage(Image.open("img/ICON_H.png"))
+
+P_labels = {}
+selected_product = [None]
+
+product_timeout_job = None
+warn_win = None
+inactive_win = None
+popup_close_job = None
+
+def start_product_timeout():
+    global product_timeout_job
+    cancel_product_timeout()
+    product_timeout_job = root.after(15000, show_inactivity_popup)
+
+def reset_product_timeout():
+    start_product_timeout()
+
+def cancel_product_timeout():
+    global product_timeout_job
+    if product_timeout_job:
+        try:
+            root.after_cancel(product_timeout_job)
+        except:
+            pass
+        product_timeout_job = None
+
+def show_custom_warning():
+    global warn_win, popup_img_tk, btn_img_tk
+    warn_win = tk.Toplevel(root)
+    warn_win.overrideredirect(True)
+    warn_win.geometry("740x400+470+325")
+    warn_win.configure(bg="#282828")
+
+    popup_img = Image.open("img/POPUP_NS.png")
+    popup_img_tk = ImageTk.PhotoImage(popup_img)
+    lbl = tk.Label(warn_win, image=popup_img_tk, bd=0)
+    lbl.pack()
+
+    btn_img = Image.open("img/BTN_POP_OK.png")
+    btn_img_tk = ImageTk.PhotoImage(btn_img)
+
+    btn = tk.Button(
+        warn_win,
+        image=btn_img_tk,
+        bd=0,
+        highlightthickness=0,
+        bg="#FFFFFF",
+        activebackground="#FFFFFF",
+        command=close_warn_popup
+    )
+    btn.place(x=240, y=276, width=260, height=110)
+
+    warn_win.grab_set()
+
+def close_warn_popup():
+    global warn_win
+    try:
+        warn_win.destroy()
+    except:
+        pass
+    warn_win = None
+    start_product_timeout()
+
+def show_inactivity_popup():
+    global inactive_win, popup_img_tk, btn_img_tk, popup_close_job
+
+    try:
+        if warn_win and warn_win.winfo_exists():
+            start_product_timeout()
+            return
+    except:
+        pass
+
+    inactive_win = tk.Toplevel(root)
+    inactive_win.overrideredirect(True)
+    inactive_win.geometry("740x400+470+325")
+    inactive_win.configure(bg="#282828")
+
+    popup_img = Image.open("img/POPUP_NC.png")
+    popup_img_tk = ImageTk.PhotoImage(popup_img)
+    lbl = tk.Label(inactive_win, image=popup_img_tk, bd=0)
+    lbl.pack()
+
+    btn_img = Image.open("img/BTN_POP_OK.png")
+    btn_img_tk = ImageTk.PhotoImage(btn_img)
+
+    btn = tk.Button(
+        inactive_win,
+        image=btn_img_tk,
+        bd=0,
+        highlightthickness=0,
+        bg="#FFFFFF",
+        activebackground="#FFFFFF",
+        command=close_inactive_popup
+    )
+    btn.place(x=240, y=276, width=260, height=110)
+
+    inactive_win.grab_set()
+    popup_close_job = root.after(10000, close_inactive_popup)
+
+def close_inactive_popup():
+    global inactive_win, popup_close_job
+    if popup_close_job:
+        try:
+            root.after_cancel(popup_close_job)
+        except:
+            pass
+        popup_close_job = None
+
+    try:
+        inactive_win.destroy()
+    except:
+        pass
+
+    inactive_win = None
+    show_page("main")
+
+def select_product(name):
+    
+    if selected_product[0] == name:
+        P_labels[name].config(image=P_imgs[name][0])    
+        stock_canvas_ch04[name].config(bg="#FFFFFF")    
+        selected_product[0] = None
+        obj_label.config(image="")
+        return
+
+    if selected_product[0]:
+        prev = selected_product[0]
+        P_labels[prev].config(image=P_imgs[prev][0])
+        stock_canvas_ch04[prev].config(bg="#FFFFFF")     
+
+    P_labels[name].config(image=P_imgs[name][1])
+    selected_product[0] = name
+    stock_canvas_ch04[name].config(bg="#AAAAAA")
+
+    if name in OBJ_imgs:
+        obj_label.config(image=OBJ_imgs[name])
+
+    reset_product_timeout()
+
+def go_to_main():
+    show_page("main")
+
+HB = tk.Button(product_frame, image=HB_img_product,
+               bd=0, bg="#91BDFF", activebackground="#91BDFF",
+               highlightthickness=0, relief="flat", command=go_to_main)
+HB.place(x=1405, y=20)
+
+coords = {"P1": (20, 140), "P2": (420, 140), "P3": (820, 140),"P4": (20, 595), "P5": (420, 595), "P6": (820, 595)}
+for name, (x, y) in coords.items():
+    label = tk.Label(product_frame, image=P_imgs[name][0],
+                     bg="#282828", bd=0, highlightthickness=0)
+    label.place(x=x, y=y, width=380, height=435)
+    label.bind("<Button-1>", lambda e, n=name: select_product(n))
+    P_labels[name] = label
+
+stock_canvas_ch04 = {}
+stock_text_ch04 = {}
+
+item_coords = {"P1": (20, 140),"P2": (420, 140),"P3": (820, 140),"P4": (20, 595),"P5": (420, 595),"P6": (820, 595),}
+
+for name, (x, y) in item_coords.items():
+    cvs = tk.Canvas(
+        product_frame,
+        width=40,
+        height=60,
+        bg="#FFFFFF",       
+        highlightthickness=0,
+        bd=0
+    )
+    cvs.place(x=x + 225, y=y + 38)
+    txt = cvs.create_text(
+        20, 30,                 
+        text="",              
+        fill="#000000",           
+        font=("Pretendard", 40, "bold")
+    )
+    cvs.bind("<Button-1>", lambda e: None)
+    stock_canvas_ch04[name] = cvs
+    stock_text_ch04[name] = txt
+
+def update_ch04_stock_labels(stock):
+    pid_map = {"P1": "A001", "P2": "A002", "P3": "A003", "P4": "A004", "P5": "A005", "P6": "A006",}
+
+    for pname, pid in pid_map.items():
+        value = stock.get(pid, 0)
+
+        stock_canvas_ch04[pname].itemconfig(
+            stock_text_ch04[pname],
+            text=str(value)
+        )
+
+def go_to_payment():
+    if selected_product[0] is None:
+        show_custom_warning()
+        return
+    CB.config(image=CB_on)
+    root.after(100, lambda: CB.config(image=CB_img))
+    root.after(150, lambda: show_page("payment"))
+
+CB = tk.Button(product_frame, image=CB_img,
+               bd=0, bg="#282828", activebackground="#282828",
+               highlightthickness=0, relief="flat", command=go_to_payment)
+CB.place(x=1225, y=760, width=430, height=270)
+
+label_img = tk.Label(product_frame, image=char_img, bg="#282828", bd=0)
+label_img.place(x=1225, y=140, width=430, height=600)
+
+frames["product"] = product_frame
+
+def soldout_listener():
+    print("🟥 SOLD OUT Listener 시작됨 — stock 감시 중")
+    last_stock = {}
+
+    pid_map = {
+        "P1": "A001",
+        "P2": "A002",
+        "P3": "A003",
+        "P4": "A004",
+        "P5": "A005",
+        "P6": "A006",
+    }
+
+    while True:
+        try:
+            res = SESSION.get(f"{FIREBASE_BASE}/stock.json", timeout=5)
+            if res.status_code != 200:
+                time.sleep(1.2)
+                continue
+
+            stock = res.json()
+
+            if stock != last_stock:
+                last_stock = stock
+
+                def update_ui():
+                    for pname, pid in pid_map.items():
+                        # 재고 없음 → SOLD OUT 이미지
+                        if stock.get(pid, 0) == 0:
+                            P_labels[pname].config(image=P_imgs[pname][2])
+                            P_labels[pname].image = P_imgs[pname][2]
+                            P_labels[pname].unbind("<Button-1>")
+
+                        # 재고 있음 → 기본 이미지 복귀
+                        else:
+                            P_labels[pname].config(image=P_imgs[pname][0])
+                            P_labels[pname].image = P_imgs[pname][0]
+                            P_labels[pname].bind("<Button-1>", lambda e, n=pname: select_product(n))
+
+                root.after(0, update_ui)
+                root.after(0, lambda stock=stock: update_ch04_stock_labels(stock))
+
+
+        except Exception as e:
+            print(f"[soldout_listener Error] {e}")
+
+        time.sleep(1.2)
+
+
+# --------------------- 결제 화면 ---------------------------------
+
+payment_frame = tk.Frame(root, width=1680, height=1050)
+
+bg_img = ImageTk.PhotoImage(Image.open("img/BG.png"))
+tk.Label(payment_frame, image=bg_img).place(x=0, y=0, width=1680, height=1050)
+
+OBJ_imgs = {
+    "P1": ImageTk.PhotoImage(Image.open("img/OBJECT_1.png")),
+    "P2": ImageTk.PhotoImage(Image.open("img/OBJECT_2.png")),
+    "P3": ImageTk.PhotoImage(Image.open("img/OBJECT_3.png")),
+    "P4": ImageTk.PhotoImage(Image.open("img/OBJECT_4.png")),
+    "P5": ImageTk.PhotoImage(Image.open("img/OBJECT_5.png")),
+    "P6": ImageTk.PhotoImage(Image.open("img/OBJECT_6.png")),
+}
+
+PAY_imgs = {
+    "QR": [ImageTk.PhotoImage(Image.open("img/QR_BTN_N.png")),
+           ImageTk.PhotoImage(Image.open("img/QR_BTN_P.png"))],
+    "APP": [ImageTk.PhotoImage(Image.open("img/APP_BTN_N.png")),
+            ImageTk.PhotoImage(Image.open("img/APP_BTN_P.png"))],
+    "CARD": [ImageTk.PhotoImage(Image.open("img/CARD_BTN_N.png")),
+             ImageTk.PhotoImage(Image.open("img/CARD_BTN_P.png"))],
+}
+
+interaction_locked = False
+blocker_layer = None
+
+def lock_interaction():
+    global interaction_locked, blocker_layer
+    if interaction_locked:
+        return
+    interaction_locked = True
+
+    blocker_layer = tk.Label(payment_frame, bg="#000000")
+    blocker_layer.place(x=0, y=0, width=1680, height=1050)
+    blocker_layer.bind("<Button-1>", lambda e: "break")  
+    blocker_layer.bind("<Key>", lambda e: "break")       
+    blocker_layer.lower() 
+
+def unlock_interaction():
+    global interaction_locked, blocker_layer
+    if not interaction_locked:
+        return
+    interaction_locked = False
+    try:
+        blocker_layer.destroy()
+    except:
+        pass
+    blocker_layer = None
+
+nonpayment_timer = None
+
+def start_nonpayment_timer():
+    global nonpayment_timer
+    cancel_nonpayment_timer()
+    nonpayment_timer = root.after(15000, show_nonpayment_popup)
+
+def cancel_nonpayment_timer():
+    global nonpayment_timer
+    if nonpayment_timer:
+        try:
+            root.after_cancel(nonpayment_timer)
+        except:
+            pass
+        nonpayment_timer = None
+
+def show_nonpayment_popup():
+    global nonpayment_win, popup_img_tk, btn_img_tk
+    try:
+        close_qr_popup()
+    except:
+        pass
+    try:
+        close_card_popup()
+    except:
+        pass
+    lock_interaction()
+
+    nonpayment_win = tk.Toplevel(root)
+    nonpayment_win.overrideredirect(True)
+    nonpayment_win.geometry("740x400+470+325")
+    nonpayment_win.configure(bg="#282828")
+    nonpayment_win.grab_set()
+
+    popup_img = Image.open("img/POPUP_NP.png") 
+    popup_img_tk = ImageTk.PhotoImage(popup_img)
+    lbl = tk.Label(nonpayment_win, image=popup_img_tk, bd=0)
+    lbl.pack()
+
+    btn_img = Image.open("img/BTN_POP_OK.png")
+    btn_img_tk = ImageTk.PhotoImage(btn_img)
+    btn = tk.Button(nonpayment_win, image=btn_img_tk,
+                    bd=0, highlightthickness=0,
+                    bg="#FFFFFF", activebackground="#FFFFFF",
+                    command=close_nonpayment_popup)
+    btn.place(x=240, y=276, width=260, height=110)
+    nonpayment_win.after(10000, close_nonpayment_popup)
+    nonpayment_win.popup_img_tk = popup_img_tk
+    nonpayment_win.btn_img_tk = btn_img_tk
+
+def close_nonpayment_popup():
+    global nonpayment_win
+    try:
+        nonpayment_win.destroy()
+    except:
+        pass
+    nonpayment_win = None
+    unlock_interaction()
+    cancel_nonpayment_timer()
+    show_page("main")
+
+def show_app_processing_popup():
+    global app_proc_win, app_proc_img_tk
+    try:
+        if "app_proc_win" in globals() and app_proc_win and app_proc_win.winfo_exists():
+            return
+
+        app_proc_win = tk.Toplevel(root)
+        app_proc_win.overrideredirect(True)
+        app_proc_win.geometry("1080x600+300+225")
+        app_proc_win.configure(bg="#282828")
+        img = Image.open("img/APP_BG.png")
+        app_proc_img_tk = ImageTk.PhotoImage(img)
+        lbl = tk.Label(app_proc_win, image=app_proc_img_tk, bd=0)
+        lbl.place(x=0, y=0, width=1080, height=600)
+        app_proc_win.lbl = lbl
+        app_proc_win.app_proc_img_tk = app_proc_img_tk
+        print(" 앱 결제 진행 중")
+    except Exception as e:
+        print(f"[show_app_processing_popup Error] {e}")
+
+def close_app_processing_popup():
+
+    global app_proc_win
+    try:
+        if app_proc_win and app_proc_win.winfo_exists():
+            app_proc_win.destroy()
+    except:
+        pass
+    app_proc_win = None
+
+
+qr_popup_job = None
+
+def show_qr_popup():
+    global qr_bg_img_tk, qr_popup_label, qr_code_label, qr_popup_job
+    disable_payment_buttons()
+    start_nonpayment_timer()
+
+    qr_bg = Image.open("img/QR_BG.png")
+    qr_bg_img_tk = ImageTk.PhotoImage(qr_bg)
+
+    qr_popup_label = tk.Label(payment_frame, image=qr_bg_img_tk, bg="#282828", bd=0)
+    qr_popup_label.place(x=300, y=225, width=1080, height=600)
+
+    selected = selected_product[0]
+
+    if not selected:
+        data = "no_product"
+    else:
+        product_id_map = {
+            "P1": "1OBJ",
+            "P2": "2OBJ",
+            "P3": "3OBJ",
+            "P4": "4OBJ",
+            "P5": "5OBJ",
+            "P6": "6OBJ",
+        }
+        data = f"MOAS_{product_id_map.get(selected, '')}"
+
+
+
+    qr = qrcode.make(data).resize((350, 350))
+    qr_img_tk = ImageTk.PhotoImage(qr)
+
+    qr_code_label = tk.Label(qr_popup_label, image=qr_img_tk, bg="black", bd=0)
+    qr_code_label.image = qr_img_tk
+    qr_code_label.place(x=365, y=104, width=350, height=350)
+
+    start_payment_check()
+
+def close_qr_popup():
+    global qr_popup_job
+    if qr_popup_job:
+        root.after_cancel(qr_popup_job)
+        qr_popup_job = None
+    try:
+        qr_code_label.destroy()
+        qr_popup_label.destroy()
+    except:
+        pass
+    enable_payment_buttons()
+
+def show_card_popup():
+    global gif_label, gif_frames, gif_index
+    disable_payment_buttons()
+    start_nonpayment_timer()
+
+    gif = Image.open("img/POPUP_CARD.gif")
+    gif_frames = []
+    try:
+        while True:
+            frame = gif.copy()
+            gif_frames.append(ImageTk.PhotoImage(frame))
+            gif.seek(len(gif_frames))
+    except EOFError:
+        pass
+
+    gif_index = 0
+
+    gif_label = tk.Label(payment_frame, bg="#282828")
+    gif_label.place(x=300, y=225, width=1080, height=600)
+
+    animate_card_gif()
+
+def animate_card_gif():
+    global gif_index
+    if not gif_frames:
+        return
+    frame = gif_frames[gif_index]
+    gif_label.config(image=frame)
+    gif_label.image = frame
+    gif_index = (gif_index + 1) % len(gif_frames)
+    root.after(300, animate_card_gif)
+
+
+def close_card_popup():
+    try:
+        gif_label.destroy()
+    except:
+        pass
+    enable_payment_buttons()
+
+def show_pickup_popup():
+    global pickup_win, pickup_img_tk, pickup_btn_img_tk
+
+    try:
+        for name in ["pickup_win", "payok_win"]:
+            try:
+                w = globals().get(name)
+                if w and hasattr(w, "winfo_exists") and w.winfo_exists():
+                    w.destroy()
+                    globals()[name] = None
+                    print("닫힘")
+            except Exception as e:
+                print(f"{name} 오류: {e}")
+        lock_interaction()
+
+        pickup_win = tk.Toplevel(root)
+        pickup_win.overrideredirect(True)
+        pickup_win.geometry("1200x800+240+125")
+        pickup_win.configure(bg="#282828")
+        popup_img = Image.open("img/POPUP_PICKUP.png")
+        pickup_img_tk = ImageTk.PhotoImage(popup_img)
+        lbl = tk.Label(pickup_win, image=pickup_img_tk, bd=0)
+        lbl.place(x=0, y=0, width=1200, height=800)
+
+        btn_img = Image.open("img/POPUP_OKBTN2.png")
+        pickup_btn_img_tk = ImageTk.PhotoImage(btn_img)
+        btn = tk.Button(
+            pickup_win,
+            image=pickup_btn_img_tk,
+            bd=0,
+            highlightthickness=0,
+            bg="#FFFFFF",
+            activebackground="#FFFFFF",
+            command=on_pickup_confirm
+        )
+        btn.place(x=285, y=610, width=630, height=140)
+
+        pickup_win.lbl = lbl
+        pickup_win.popup_img_tk = pickup_img_tk
+        pickup_win.pickup_btn_img_tk = pickup_btn_img_tk
+
+
+        root.after(200, lambda: safe_grab(pickup_win))
+        print("PICKUP  표시 완료")
+    except Exception as e:
+        print(f"[show_pickup_popup Error] {e}")
+
+def safe_grab(win):
+    try:
+        if win and win.winfo_exists():
+            win.grab_set()
+            print("물건 수령 완료")
+    except Exception as e:
+        print(f"[Pickup grab_set Error] {e}")
+
+def on_pickup_confirm():
+    global pickup_win
+    try:
+        
+        if pickup_win and pickup_win.winfo_exists():
+            pickup_win.destroy()
+        if serial_port:
+            try:
+                serial_port.write(b'B')
+                print("'B' 명령 전송 — 즉시 후진 시작")
+            except Exception as e:
+                print(f"B 전송 실패: {e}")
+    except Exception as e:
+        print(f"[Pickup Popup Close Error] {e}")
+    finally:
+        unlock_interaction()
+
+obj_label = tk.Label(payment_frame, bg="#282828")
+obj_label.place(x=440, y=160)
+
+btn_qr = tk.Button(payment_frame, image=PAY_imgs["QR"][0],
+                   bd=0, bg="#282828", activebackground="#282828",
+                   highlightthickness=0, relief="flat",
+                   command=lambda: handle_qr_click())
+btn_qr.place(x=60, y=850)
+
+btn_app = tk.Button(payment_frame, image=PAY_imgs["APP"][0],
+                    bd=0, bg="#282828", activebackground="#282828",
+                    highlightthickness=0, relief="flat",
+                    command=lambda: show_barcode_popup())
+
+btn_app.place(x=600, y=850)
+
+btn_card = tk.Button(payment_frame, image=PAY_imgs["CARD"][0],
+                     bd=0, bg="#282828", activebackground="#282828",
+                     highlightthickness=0, relief="flat",
+                     command=lambda: handle_card_click())
+btn_card.place(x=1140, y=850)
+
+button_locked = False  
+
+def disable_payment_buttons():
+    global button_locked
+    button_locked = True
+
+def enable_payment_buttons():
+    global button_locked
+    button_locked = False
+
+def handle_qr_click():
+    global button_locked
+    if button_locked:
+        return  
+    disable_payment_buttons()
+    show_qr_popup()
+
+def handle_card_click():
+    global button_locked
+    if button_locked:
+        return
+    disable_payment_buttons()
+    show_card_popup()
+
+def handle_app_click():
+    global button_locked
+    if button_locked:
+        return
+    disable_payment_buttons()
+    show_barcode_popup()
+
+BACK_img = ImageTk.PhotoImage(Image.open("img/ICON_B.png"))
+btn_back2 = tk.Button(payment_frame, image=BACK_img,
+                      bd=0, bg="#91BDFF", activebackground="#91BDFF",
+                      highlightthickness=0, relief="flat",
+                      command=lambda: show_page("product"))
+btn_back2.place(x=25, y=20)
+
+HB_img_payment = ImageTk.PhotoImage(Image.open("img/ICON_H.png"))
+HB2 = tk.Button(payment_frame, image=HB_img_payment,
+                bd=0, bg="#91BDFF", activebackground="#91BDFF",
+                highlightthickness=0, relief="flat",
+                command=lambda: show_page("main"))
+HB2.place(x=1405, y=20)
+
+frames["payment"] = payment_frame
+
+BARCODE_DEVICE_PATH = "/dev/input/event5"
+barcode_running = False
+barcode_popup = None
+barcode_close_timer = None
+
+def close_barcode_popup():
+    global barcode_popup, barcode_close_timer
+
+    if barcode_close_timer:
+        try:
+            root.after_cancel(barcode_close_timer)
+        except:
+            pass
+        barcode_close_timer = None
+
+    try:
+        if barcode_popup and barcode_popup.winfo_exists():
+            barcode_popup.destroy()
+    except:
+        pass
+
+    barcode_popup = None
+    enable_payment_buttons()
+
+def barcode_timeout_handler():
+    global barcode_running
+    print("바코드 미동작")
+
+    barcode_running = False
+    try:
+        if serial_port:
+            serial_port.write(b"F\n")
+            print("BOFF 전송됨 (미동작)")
+    except:
+        pass
+
+    close_barcode_popup()
+    show_nonpayment_popup()
+
+def show_barcode_popup():
+    global barcode_running, barcode_popup, barcode_close_timer
+
+    if barcode_running:
+        return
+
+    barcode_running = True
+
+    disable_payment_buttons()
+
+    try:
+        if serial_port:
+            serial_port.write(b"O\n")
+            print("BON 전송됨 바코드 스캐너 작동")
+    except:
+        print("BON 전송 오류")
+
+    try: close_qr_popup()
+    except: pass
+    try: close_card_popup()
+    except: pass
+
+    barcode_popup = tk.Toplevel(root)
+    barcode_popup.overrideredirect(True)
+    barcode_popup.geometry("1080x600+300+225")
+    barcode_popup.configure(bg="#000000")
+
+    img = Image.open("img/BarCode_popup.png")
+    popup_img_tk = ImageTk.PhotoImage(img)
+    lbl = tk.Label(barcode_popup, image=popup_img_tk, bd=0)
+    lbl.place(x=0, y=0, width=1080, height=600)
+    barcode_popup.img_ref = popup_img_tk
+    barcode_popup.grab_set()
+    barcode_close_timer = root.after(15000, barcode_timeout_handler)
+    threading.Thread(target=barcode_listener, daemon=True).start()
+    print("바코드 결제 완료")
+
+def barcode_listener():
+    global barcode_running
+
+    print("바코드 스캔 대기")
+
+    try:
+        device = InputDevice(BARCODE_DEVICE_PATH)
+    except:
+        print("바코드 장치 연결 실패")
+        barcode_timeout_handler()
+        return
+
+    barcode = ""
+    mapping = {
+        "KEY_0":"0","KEY_1":"1","KEY_2":"2","KEY_3":"3","KEY_4":"4",
+        "KEY_5":"5","KEY_6":"6","KEY_7":"7","KEY_8":"8","KEY_9":"9",
+
+        "KEY_A":"A","KEY_B":"B","KEY_C":"C","KEY_D":"D","KEY_E":"E",
+        "KEY_F":"F","KEY_G":"G","KEY_H":"H","KEY_I":"I","KEY_J":"J",
+        "KEY_K":"K","KEY_L":"L","KEY_M":"M","KEY_N":"N","KEY_O":"O",
+        "KEY_P":"P","KEY_Q":"Q","KEY_R":"R","KEY_S":"S","KEY_T":"T",
+        "KEY_U":"U","KEY_V":"V","KEY_W":"W","KEY_X":"X","KEY_Y":"Y",
+        "KEY_Z":"Z"
+    }
+
+    for event in device.read_loop():
+        if not barcode_running:
+            break
+        if event.type == ecodes.EV_KEY:
+            key = categorize(event)
+            if key.keystate == 1:  # keydown
+                if key.keycode == "KEY_ENTER":
+                    print(f"🔍 스캔된 바코드: {barcode}")
+                    if barcode.startswith("MOAS"):
+                        root.after(0, lambda b=barcode: handle_barcode_success(b))
+                    barcode = ""
+                    break
+                if key.keycode in mapping:
+                    barcode += mapping[key.keycode]
+def handle_barcode_success(code):
+    global barcode_running
+
+    if barcode_running is False:
+        return
+    barcode_running = False
+    print(f"바코드 결제 성공: {code}")
+
+    try: close_barcode_popup()
+    except: pass
+    try:
+        if serial_port:
+            serial_port.write(b"F\n")
+            print("BOFF 전송됨 결제 성공")
+    except:
+        pass
+
+    try: cancel_nonpayment_timer()
+    except:
+        pass
+
+    selected = selected_product[0]  
+    pid_map = {
+        "P1":"A001","P2":"A002","P3":"A003",
+        "P4":"A004","P5":"A005","P6":"A006"
+    }
+    pid = pid_map.get(selected)
+    if pid is None:
+        return
+
+    idx = list(P_labels.keys()).index(selected) + 1
+    order_id = f"order_test_00{idx}"
+
+    try:
+        SESSION.patch(
+            f"{ORDERS_URL}/{order_id}.json",
+            json={"status": "paid", "product_id": pid}
+        )
+        start_payment_check()
+
+    except Exception as e:
+        print("Firebase 오류:", e)
+        return
+
+
+#-----------기능함수----------------------------
+
+def start_payment_check():
+    selected = selected_product[0]
+    if not selected:
+        return
+
+    idx = list(P_labels.keys()).index(selected) + 1
+    order_id = f"order_test_00{idx}"
+
+    def worker():
+        while True:
+            try:
+                res = SESSION.get(f"{ORDERS_URL}/{order_id}.json", timeout=5)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get("status") == "paid":
+                        pid = data.get("product_id", "")
+                        pid_map = {"A001": "1","A002": "2","A003": "3",
+                                   "A004": "4","A005": "5","A006": "6"}
+                        motor_char = pid_map.get(pid)
+
+                        root.after(0, lambda: [
+                            close_qr_popup(),
+                            show_pending_popup(
+                                next_action=lambda: [
+                                    show_payment_success_popup("QR"),
+                                    send_motor_command(motor_char),
+                                    reset_firebase_status(order_id)
+                                ]
+                            )
+                        ])
+                        return
+            except Exception as e:
+                print(f"Exception in Firebase check: {e}")
+            time.sleep(1)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+pending_gif_frames = []
+pending_gif_index = 0
+pending_label = None
+pending_job = None
+
+def show_pending_popup(next_action=None):
+    global pending_gif_frames, pending_gif_index, pending_label, pending_job
+    disable_payment_buttons()
+    cancel_nonpayment_timer()
+
+    if not pending_gif_frames:
+        gif = Image.open("img/POPUP_PENDING.gif")
+        try:
+            while True:
+                frame = gif.copy()
+                pending_gif_frames.append(ImageTk.PhotoImage(frame))
+                gif.seek(len(pending_gif_frames))
+        except EOFError:
+            pass
+
+    pending_label = tk.Label(root, bg="#282828")
+    pending_label.place(x=470, y=325, width=740, height=400)
+
+    pending_gif_index = 0
+    animate_pending_gif()
+    pending_job = root.after(2000, lambda: close_pending_popup(next_action))
+
+def animate_pending_gif():
+    global pending_gif_index, pending_label, pending_gif_frames
+    if not pending_gif_frames or not pending_label:
+        return
+    frame = pending_gif_frames[pending_gif_index]
+    pending_label.config(image=frame)
+    pending_label.image = frame
+    pending_gif_index = (pending_gif_index + 1) % len(pending_gif_frames)
+    root.after(200, animate_pending_gif)
+
+def close_pending_popup(next_action=None):
+    global pending_label, pending_job
+    try:
+        if pending_job:
+            root.after_cancel(pending_job)
+            pending_job = None
+        if pending_label and pending_label.winfo_exists():
+            pending_label.destroy()
+            pending_label = None
+    except Exception as e:
+        print(f"close_pending_popup error: {e}")
+    enable_payment_buttons()
+    if next_action:
+        next_action()
+
+def show_payment_success_popup(pay_type="QR"):
+    global payok_win, popup_img_tk
+    lock_interaction()
+    try:
+        if payok_win and payok_win.winfo_exists():
+            payok_win.destroy()
+    except:
+        pass
+
+    payok_win = tk.Toplevel(root)
+    payok_win.overrideredirect(True)
+    payok_win.geometry("1080x600+300+225")
+    payok_win.configure(bg="#FFFFFF")
+
+    if pay_type == "CARD":
+        img_path = "img/POPUP_PAYCARD.png"
+    else:
+        img_path = "img/POPUP_PAYQR.png"
+
+    popup_img = Image.open(img_path)
+    popup_img_tk = ImageTk.PhotoImage(popup_img)
+    lbl = tk.Label(payok_win, image=popup_img_tk, bd=0)
+    lbl.pack()
+    payok_win.popup_img_tk = popup_img_tk
+    payok_win.grab_set()
+    print("결제 완료  CE신호 대기 중")
+
+def send_motor_command(motor_char):
+    if motor_char and serial_port:
+        try:
+            serial_port.write(motor_char.encode())
+            print(f" Sent '{motor_char}' to Arduino")
+        except Exception as e:
+            print(f" Serial write error: {e}")
+
+def reset_firebase_status(order_id):
+    def worker():
+        try:
+            time.sleep(2)
+            SESSION.patch(
+                f"{ORDERS_URL}/{order_id}.json",
+                json={"status": "pending"},
+                timeout=5
+            )
+            print(f"[Firebase] {order_id} 상태 'pending' 복귀")
+        except Exception as e:
+            print(f" Reset status error: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+nfc_processing_lock = threading.Lock()
+
+def on_nfc_connect(tag):
+    if not nfc_processing_lock.acquire(blocking=False):
+        return True
+    print(" NFC 태그 인식")
+
+    if tag.ndef:
+        for record in tag.ndef.records:
+            if record.type == 'urn:nfc:wkt:T' and record.text == "MOAS":
+                threading.Thread(target=process_nfc_payment, daemon=True).start()
+                break
+    return True
+
+def process_nfc_payment():
+    try:
+        selected = selected_product[0]
+        if not selected:
+            nfc_processing_lock.release()
+            return
+
+        idx = list(P_labels.keys()).index(selected) + 1
+        order_id = f"order_test_00{idx}"
+
+        print(f"NFC 결제: Firebase 상태 변경 {order_id} → paid")
+        patch_res = SESSION.patch(
+            f"{ORDERS_URL}/{order_id}.json",
+            json={"status": "paid"},
+            timeout=5
+        )
+
+        if patch_res.status_code != 200:
+            print(f"Firebase 상태 변경 실패: {patch_res.text}")
+            nfc_processing_lock.release()
+            return
+
+        try:
+            close_card_popup()
+        except Exception as e:
+            print(f"CARD 팝업 닫기 실패: {e}")
+
+        # ✅ 2️⃣ 0.3초 딜레이 후 “결제중입니다” GIF 시작
+        root.after(300, lambda: show_pending_popup(
+            next_action=lambda: [
+                show_payment_success_popup("CARD"),  # 결제 완료 5초 유지
+                send_motor_command(str(idx)),        # 아두이노 신호 전송
+                reset_firebase_status(order_id)      # Firebase 상태 복귀
+            ]
+        ))
+
+    except Exception as e:
+        print(f" NFC 결제 처리 오류: {e}")
+    finally:
+        nfc_processing_lock.release()
+
+def nfc_listener():
+
+    while True:
+        try:
+            print(" NFC 리더기 연결 시도")
+            clf = nfc.ContactlessFrontend('tty:USB0:pn532')
+            print("NFC 리더기 연결 성공")
+            while True:
+                clf.connect(rdwr={'on-connect': on_nfc_connect})
+        except Exception as e:
+            print(f" NFC 리더기 에러: {e}")
+            time.sleep(10)
+
+def decrease_stock_after_payment(pid):
+    try:
+        res = SESSION.get(f"{FIREBASE_BASE}/stock/{pid}.json", timeout=5)
+        if res.status_code != 200:
+            print(f"[Stock] 재고 조회 실패: {pid}")
+            return
+        
+        current = res.json()
+        if current is None:
+            current = 0
+        new_value = max(0, current - 1)
+        SESSION.patch(
+            f"{FIREBASE_BASE}/stock.json",
+            json={pid: new_value},
+            timeout=5
+        )
+
+    except Exception as e:
+        print(f"[Stock] 감소 중 오류: {e}")
+
+def decrease_stock_after_finish():
+    try:
+        pname = selected_product[0]   # "P1" ~ "P6"
+
+        pid_map = {"P1": "A001","P2": "A002","P3": "A003","P4": "A004","P5": "A005","P6": "A006", }
+        if pname in pid_map:
+            pid = pid_map[pname]
+            decrease_stock_after_payment(pid)
+            print(f"재고 감소 완료: {pid}")
+    except Exception as e:
+        print(f"[FINISH ERROR] 재고 감소 실패: {e}")
+
+def show_finish_frame():
+    global finish_frame, finish_bg_img_tk
+    lock_interaction() 
+    try:
+        pickup_win.destroy()
+    except:
+        pass
+
+    try:
+        if 'finish_frame' in globals() and finish_frame.winfo_exists():
+            finish_frame.destroy()
+    except:
+        pass
+
+    finish_frame = tk.Frame(root, width=1680, height=1050, bg="#000000")
+    finish_frame.place(x=0, y=0)
+    finish_bg = Image.open("img/FINISH_BG.png")
+    finish_bg_img_tk = ImageTk.PhotoImage(finish_bg)
+    lbl = tk.Label(finish_frame, image=finish_bg_img_tk, bd=0)
+    lbl.place(x=0, y=0, width=1680, height=1050)
+
+    finish_frame.bg_ref = finish_bg_img_tk
+
+    print(" 후진 완료(FE) 신호 대기 중")
+    root.after(300, decrease_stock_after_finish)
+
+
+def close_all_popups():
+    global payok_win, qr_popup_label, gif_label
+    for name in ["payok_win", "qr_popup_label", "gif_label"]:
+        try:
+            w = globals().get(name)
+            if w and hasattr(w, "winfo_exists") and w.winfo_exists():
+                w.destroy()
+                
+        except Exception as e:
+            print(f"close_all_popups {name} 오류: {e}")
+
+def app_order_listener():
+
+    print(" APPOrder/status 감시 중")
+
+    APPORDER_URL = f"{ORDERS_URL}/APPOrder/status.json"
+    last_state = None
+
+    while True:
+        try:
+            res = SESSION.get(APPORDER_URL, timeout=5)
+            if res.status_code == 200:
+                current = res.json()
+
+                if current != last_state:
+                    print(f"[APPOrder 감지] 상태 변경: {last_state} → {current}")
+                    last_state = current
+
+                    if str(current).lower() == "true":
+                        root.after(0, lambda: [
+                            show_page("main"),
+                            show_app_processing_popup()
+                        ])
+                        print("앱 진입")
+                    elif str(current).lower() == "false":
+                        root.after(0, lambda: [
+                            close_app_processing_popup()
+                        ])
+                        print("앱 종료")
+            else:
+                print(f"Firebase 응답 코드 이상: {res.status_code}")
+        except Exception as e:
+            print(f"[APP Order Listener Error] {e}")
+        time.sleep(1)
+      
+def app_payment_listener():
+
+    print("Firebase orders 상태 감시")
+
+    last_status = {}
+
+    while True:
+        try:
+            res = SESSION.get(f"{ORDERS_URL}.json", timeout=5)
+            if res.status_code == 200:
+                orders = res.json()
+
+                for order_id, data in orders.items():
+                    if not isinstance(data, dict):
+                        continue
+
+                    if not order_id.startswith("app_"):
+                        continue
+
+                    current = data.get("status")
+                    previous = last_status.get(order_id)
+                    pid = data.get("product_id", "")
+                    pid_map = {"A001": "1","A002": "2","A003": "3",
+                               "A004": "4","A005": "5","A006": "6"}
+                    motor_char = pid_map.get(pid)
+
+                    if current == "paid" and previous != "paid":
+                        print(f"🟩 [APP] {order_id} paid 감지 — 결제 시퀀스 실행")
+
+                        root.after(0, lambda oid=order_id, mchar=motor_char: [
+                            close_app_processing_popup(),
+                            show_pending_popup(
+                                next_action=lambda: [
+                                    show_payment_success_popup("APP"),
+                                    send_motor_command(mchar),
+                        
+                                ]
+                            )
+                        ])
+
+                    elif current == "pending" and previous in ["app_active", "paid"]:
+                        root.after(0, lambda: [
+                            close_all_popups(),
+                            close_app_processing_popup(),
+                            unlock_interaction(),
+                            show_page("main"),
+
+                        ])
+
+                    last_status[order_id] = current
+            else:
+                print(f"[APP Listener] Firebase 응답 코드 이상: {res.status_code}")
+        except Exception as e:
+            print(f"[APP Listener Error] {e}")
+        time.sleep(1)
+
+def arduino_listener():
+    print(" 상태 신호 대기")
+    while True:
+        try:
+            if serial_port and serial_port.in_waiting > 0:
+                msg = serial_port.readline().decode(errors="ignore").strip()
+                if not msg:
+                    continue
+
+                if msg == "CE":
+                    print("[CE] 전진 완료")
+
+                    def handle_pickup():
+                        try:
+                            close_all_popups()
+                        except Exception as e:
+                            print(f"[close_all_popups Error] {e}")
+                        root.after(500, lambda: show_pickup_popup())
+                    root.after(0, handle_pickup)
+
+                elif msg == "BE":
+                    print("🟦 [BE] 후진 시작")
+                    root.after(0, lambda: show_finish_frame())
+
+                elif msg == "FE":
+                    print("[FE] 후진 완료")
+
+                    def restore_main():
+                        global interaction_locked, blocker_layer, pending_job, nonpayment_timer
+                        global payok_win, qr_popup_label, gif_label, pickup_win, finish_frame
+                        unlock_interaction()
+                        for job in [pending_job, nonpayment_timer]:
+                            try:
+                                if job:
+                                    root.after_cancel(job)
+                            except:
+                                pass
+                        pending_job = None
+                        nonpayment_timer = None
+
+                        for win_name in ["payok_win", "qr_popup_label", "gif_label", "pickup_win"]:
+                            try:
+                                win = globals().get(win_name)
+                                if win and hasattr(win, "winfo_exists") and win.winfo_exists():
+                                    win.destroy()
+                                    globals()[win_name] = None
+                            except Exception as e:
+                                print(f"⚠️ FE Popup Close Error ({win_name}): {e}")
+
+                        try:
+                            if finish_frame and finish_frame.winfo_exists():
+                                finish_frame.destroy()
+                        except:
+                            pass
+
+                        root.update_idletasks()
+                        show_page("main")
+                    root.after(0, restore_main)
+
+                else:
+                    print(f"[Serial] Unknown msg: {msg}")
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"[Arduino Listener Error] {e}")
+            time.sleep(1)
+        
+frames["product"]
+show_page("main")
+
+threading.Thread(target=nfc_listener, daemon=True).start()
+threading.Thread(target=arduino_listener, daemon=True).start()
+threading.Thread(target=driving_state_listener, daemon=True).start()
+threading.Thread(target=soldout_listener, daemon=True).start()
+threading.Thread(target=app_payment_listener, daemon=True).start()
+threading.Thread(target=app_order_listener, daemon=True).start()
+
+root.mainloop()
+
+
